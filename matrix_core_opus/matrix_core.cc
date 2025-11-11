@@ -15,6 +15,7 @@
 
 #define LOCAL_SCRATCH 0
 #define RAND_INT 0
+#define CUSTOMIZED_INT 1
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define HIP_CALL(call) do{  \
@@ -750,6 +751,28 @@ void rand_vector_2d_int(float* v, int row, int col, int ld){
     }
 }
 
+void customized_vector_2d_in(float* v, int row, int col, int ld){
+    int r,c;
+    static int flag = 0;
+    if(!flag){ srand(time(NULL)); flag = 1; }
+    for(r=0;r<row;r++){
+        for(c=0;c<col;c++){
+            v[r*ld+c] = ((float)(r*ld+c)/10);
+        }
+    }
+}
+
+void customized_vector_2d_weight(float* v, int row, int col, int ld){
+    int r,c;
+    static int flag = 0;
+    if(!flag){ srand(time(NULL)); flag = 1; }
+    for(r=0;r<row;r++){
+        for(c=0;c<col;c++){
+            v[r*ld+c] = ((float)(r*ld+c)/10);
+        }
+    }
+}
+
 void gemm_rcr(
     const float*  __restrict__ ptr_a,
     const float*  __restrict__ ptr_b,
@@ -933,17 +956,22 @@ void casual_conv1d_block_run()
 // #ifdef RAND_INT
 //     rand_vector_2d_int(host_in, hi, ci, ld_in);
 //     rand_vector_2d_int(host_w, ci, hk, ld_w);
+// #ifdef CUSTOMIZED_INT
+    customized_vector_2d_in(host_in, hi, ci, ld_in);
+    customized_vector_2d_weight(host_w, ci, hk, ld_w);
 // #else
-    rand_vector_2d(host_in, hi, ci, ld_in, 0.0, 1.0);
-    rand_vector_2d(host_w, ci, hk, ld_w, -0.5, 0.5);
+//     rand_vector_2d(host_in, hi, ci, ld_in, 0.0, 1.0);
+//     rand_vector_2d(host_w, ci, hk, ld_w, -0.5, 0.5);
 // #endif
-
+    // for(int i=0; i<hi*ci; i++) {if (i<100) {printf("in[%d], %f \n", i, host_in[i]);}}
+    for(int i=0; i<ci*hk; i++) {printf("w[%d], %f \n", i, host_w[i]);}
     float16 *fp16_in, *fp16_w;
     //convert fp32 input into fp16 on host
     fp16_in = (float16*)malloc((hi*ci)*sizeof(float16));
     fp16_w = (float16*)malloc((ci*hk)*sizeof(float16));
     for(int i=0; i<hi*ci; i++)fp16_in[i]=__float2half_rn(host_in[i]);
-    for(int i=0; i<hk*ci; i++)fp16_w[i]=__float2half_rn(host_w[i]);
+    for(int i=0; i<ci*hk; i++)fp16_w[i]=__float2half_rn(host_w[i]);
+    for(int i=0; i<ci*hk; i++) {printf("fp16_w[%d], %f \n", i, (float)(fp16_w[i]));}
 
     // float *host_a, *host_b, *host_c;
     float16 *fp16_in_pad, *fp16_a, *fp16_b, *fp16_c, *dev_a, *dev_b, *dev_c;
@@ -964,24 +992,37 @@ void casual_conv1d_block_run()
     for(int i = 0; i < hi * ci; i++) {
         fp16_in_pad[i + pad * ci] = fp16_in[i];
     }
+    // for(int i=0; i<(hi+pad)*ci; i++) {
+    //     if (i<200) {printf("fp16_in_pad[%d], %f \n", i, (float)(fp16_in_pad[i]));}
+    // }
     // input with pad, img2col
     for(int i=0; i < ho; i++) {
         for (int j = 0; j < hk * ci; j++) {
             fp16_a[i * hk *ci + j] = fp16_in_pad[i * ci + j];
-            // fp16_a[i * hk *ci + j] = 0;
         }
     }
+    // for(int i=0; i<ho * hk * ci; i++) {
+    //     if (i<800) {printf("fp16_a[%d], %f \n", i, (float)(fp16_a[i]));}
+    // }
     //convert dw weight to common weight
     // initialization
     for(int i=0; i < ci * hk * ci; i++) {
         fp16_b[i] = 0;
     }
     for(int i=0; i < ci; i++) {
-        for (int j = 0; j < hk; j++) {
-            for (int l = 0; l < ci; l++) {
-                if (l == i) {fp16_b[i * hk *ci + j*ci + l] = fp16_w[i * hk + l];}
+        for (int j = 0; j < hk*ci; j++) {
+            if ((j % ci) == i) {
+                fp16_b[i * hk *ci + j] = fp16_w[i * hk + int(j / ci)];
+                // printf("fp16_w[%d, %d], %f \n", i, int(j / ci), (float)(fp16_w[i * hk + int(j / ci)]));
             }
         }
+    }
+    for(int i=0; i < ci; i++) {
+        for (int j = 0; j < hk*ci; j++) {
+            // if (i<4) {printf("fp16_b[%d, %d], %f ", i, j, (float)(fp16_b[i*hk*ci +j]));}
+            if (i<4) {printf("%f ", (float)(fp16_b[i*hk*ci +j]));}
+        }
+        if (i<4) {printf("/n");}
     }
 
     HIP_CALL(hipMalloc(&dev_a, lda*m*sizeof(float16)));
