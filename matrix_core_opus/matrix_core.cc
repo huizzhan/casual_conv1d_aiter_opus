@@ -6,6 +6,8 @@
 #include <math.h>
 #include <stdio.h>
 #include <numeric>
+#include <torch/torch.h>
+#include <cstring>
 #define HALF
 #ifdef HALF
 #include "half.hpp"
@@ -880,54 +882,83 @@ void block_run()
     HIP_CALL(hipFree(dev_c));
 }
 
+// 封装成函数，避免顶层解析错误
+void run_conv1d(float* input, float* output,
+                float* weight, float* bias,
+                int N, int C_in, int C_out, int L,
+                int kernel_size, int pad, int stride = 1, int groups = 1) {
+    // 1. 定义 Conv1d 模块（局部作用域
+    auto conv = torch::nn::Conv1d(
+        torch::nn::Conv1dOptions(C_in, C_out, kernel_size)
+            .stride(stride)
+            .padding(pad)
+            .groups(groups)
+    );
+
+    // 2. 设置权重和偏置
+    auto w_tensor = torch::from_blob(weight, {C_out, C_in / groups, kernel_size}, torch::kFloat).clone();
+    auto b_tensor = torch::from_blob(bias, {C_out}, torch::kFloat).clone();
+    conv->weight = w_tensor;
+    conv->bias   = b_tensor;
+
+    // 3. 输入张量
+    auto input_tensor = torch::from_blob(input, {N, C_in, L}, torch::kFloat).clone();
+
+    // 4. 前向计算
+    auto output_tensor = conv->forward(input_tensor);
+
+    // 5. 拷贝结果到一维指针
+    int out_size = 1;
+    for (auto s : output_tensor.sizes()) out_size *= s;
+    std::memcpy(output, output_tensor.data_ptr<float>(), out_size * sizeof(float));
+
+    std::cout << "Output shape: " << output_tensor.sizes() << std::endl;}
+
 void casual_conv1d_rcr(
-    const float*  __restrict__ ptr_in,
-    const float*  __restrict__ ptr_w,
-    float*  ptr_out,
-    int hi,
-    int ci,
-    int hk,
-    int pad)
-{
-    float*  ptr_in_pad;
-    ptr_in_pad = (float*)malloc(((hi + pad) * ci)*sizeof(float));
-    // add pad for input
-    for(int i = 0; i < pad * ci; i++) {
-        ptr_in_pad[i] = 0;
-    }
-    for(int i = 0; i < hi * ci; i++) {
-        ptr_in_pad[i + pad * ci] = ptr_in[i];
-    }
-    // transpose (hi + pad)*ci to ci*(hi + pad)
-    float*  ptr_in_pad_ch;
-    ptr_in_pad_ch = (float*)malloc(((hi + pad) * ci)*sizeof(float));
-    for(int i = 0; i < ci; i++) {
-        for(int j = 0; j < hi+pad; j++) {
-            ptr_in_pad_ch[i*(hi + pad)+j] = ptr_in_pad[j*(hi + pad)+i];
-        }
-    }
-    float*  ptr_out_ch;
-    ptr_out_ch = (float*)malloc((hi * ci)*sizeof(float));
-    // PyTorch-like reference - out[ci, hi]
-    for (int i = 0; i < ci; ++i) {
-        for (int j = 0; j < hi; ++j) {
-            float acc = 0.0f;
-            for (int l = 0; l < hk; ++l) {
-                acc += ptr_in_pad[i*hi + j + l] * ptr_w[i*hi+l];
-            }
-            ptr_out_ch[i*hi + j] = acc;
-        }
-    }
-    // transpose ci*hi to hi*ci
-    for(int i = 0; i < hi; i++) {
-        for(int j = 0; j < ci; j++) {
-            ptr_out[i*ci+j] = ptr_out_ch[j*hi+i];
-        }
-    }
+    const float*  __restrict__ input,
+    float*  output,
+    const float*  __restrict__ weight,
+    const float*  __restrict__ bias,
+    int N,
+    int C_in,
+    int C_out,
+    int L,
+    int kernel_size,
+    int pad,
+    int stride = 1,
+    int groups = 1) {
+        // 1. 定义 Conv1d
+    torch::nn::Conv1d conv(
+        torch::nn::Conv1dOptions(C_in, C_out, kernel_size)
+            .stride(stride)
+            .padding(pad)
+            .groups(groups)
+    );
+ 
+    // 2. 设置权重和偏置
+    torch::Tensor w_tensor = torch::from_blob(weight, {C_out, C_in / groups, kernel_size}, torch::kFloat).clone();
+    torch::Tensor b_tensor = torch::from_blob(bias, {C_out}, torch::kFloat).clone();
+    conv->weight = w_tensor;
+    conv->bias   = b_tensor;
+ 
+    // 3. 输入张量
+    torch::Tensor input_tensor = torch::from_blob(input, {N, C_in, L}, torch::kFloat).clone();
+ 
+    // 4. 前向计算
+    torch::Tensor output_tensor = conv->forward(input_tensor);
+ 
+    // 5. 拷贝结果到一维指针
+    int out_size = 1;
+    for (auto s : output_tensor.sizes()) out_size *= s;
+    std::memcpy(output, output_tensor.data_ptr<float>(), out_size * sizeof(float));
+ 
+    // 打印输出形状
+    std::cout << "Output shape: " << output_tensor.sizes() << std::endl;
 }
 
 void casual_conv1d_block_run()
 {
+    int batch = 1;
     int hi = 32;
     int ci = 32;
     int hk = 4;
@@ -944,12 +975,13 @@ void casual_conv1d_block_run()
     int ldc = n;
 
     // init fp32 input and weight
-    float *host_in, *host_w, *host_c;
+    float *host_in, *host_w, *host_c, *host_bias;
 
     //fp32 input[hi, ci] and weight[ci, hi] on host
-    host_in = (float*)malloc(hi*ci*sizeof(float));
-    host_w = (float*)malloc(ci*hk*sizeof(float));
-    host_c = (float*)malloc(ldc*m*sizeof(float));
+    host_in = (float*)malloc(batch*hi*ci*sizeof(float));
+    host_w = (float*)malloc(batch*ci*hk*sizeof(float));
+    host_bias = (float*)malloc(batch*ci*sizeof(float));
+    host_c = (float*)malloc(batch*ldc*m*sizeof(float));
     int ld_in = ci;
     int ld_w = hk;
 
@@ -959,19 +991,20 @@ void casual_conv1d_block_run()
 // #ifdef CUSTOMIZED_INT
     customized_vector_2d_in(host_in, hi, ci, ld_in);
     customized_vector_2d_weight(host_w, ci, hk, ld_w);
+    for (int i = 0; i < batch*ci; i++) host_bias[i] = 0.0f;
 // #else
 //     rand_vector_2d(host_in, hi, ci, ld_in, 0.0, 1.0);
 //     rand_vector_2d(host_w, ci, hk, ld_w, -0.5, 0.5);
 // #endif
     // for(int i=0; i<hi*ci; i++) {if (i<100) {printf("in[%d], %f \n", i, host_in[i]);}}
-    for(int i=0; i<ci*hk; i++) {printf("w[%d], %f \n", i, host_w[i]);}
+    // for(int i=0; i<ci*hk; i++) {printf("w[%d], %f \n", i, host_w[i]);}
     float16 *fp16_in, *fp16_w;
     //convert fp32 input into fp16 on host
     fp16_in = (float16*)malloc((hi*ci)*sizeof(float16));
     fp16_w = (float16*)malloc((ci*hk)*sizeof(float16));
     for(int i=0; i<hi*ci; i++)fp16_in[i]=__float2half_rn(host_in[i]);
     for(int i=0; i<ci*hk; i++)fp16_w[i]=__float2half_rn(host_w[i]);
-    for(int i=0; i<ci*hk; i++) {printf("fp16_w[%d], %f \n", i, (float)(fp16_w[i]));}
+    // for(int i=0; i<ci*hk; i++) {printf("fp16_w[%d], %f \n", i, (float)(fp16_w[i]));}
 
     // float *host_a, *host_b, *host_c;
     float16 *fp16_in_pad, *fp16_a, *fp16_b, *fp16_c, *dev_a, *dev_b, *dev_c;
@@ -1017,13 +1050,13 @@ void casual_conv1d_block_run()
             }
         }
     }
-    for(int i=0; i < ci; i++) {
-        for (int j = 0; j < hk*ci; j++) {
-            // if (i<4) {printf("fp16_b[%d, %d], %f ", i, j, (float)(fp16_b[i*hk*ci +j]));}
-            if (i<4) {printf("%f ", (float)(fp16_b[i*hk*ci +j]));}
-        }
-        if (i<4) {printf("/n");}
-    }
+    // for(int i=0; i < ci; i++) {
+    //     for (int j = 0; j < hk*ci; j++) {
+    //         // if (i<4) {printf("fp16_b[%d, %d], %f ", i, j, (float)(fp16_b[i*hk*ci +j]));}
+    //         if (i<4) {printf("%f ", (float)(fp16_b[i*hk*ci +j]));}
+    //     }
+    //     if (i<4) {printf("/n");}
+    // }
 
     HIP_CALL(hipMalloc(&dev_a, lda*m*sizeof(float16)));
     HIP_CALL(hipMalloc(&dev_b, ldb*n*sizeof(float16)));
@@ -1034,7 +1067,7 @@ void casual_conv1d_block_run()
 
     printf("m:%d,n:%d,k:%d,lda:%d,ldb:%d,ldc:%d\n",  m, n, k, lda, ldb, ldc); fflush(stdout);
     // gemm_rcr(host_a, host_b, host_c, m,n,k,lda,ldb,ldc);
-    casual_conv1d_rcr(host_in, host_w, host_c, hi, ci, hk, pad);
+    casual_conv1d_rcr(host_in, host_c, host_w, host_bias, batch, ci, ci, hi, hk, pad, 1, ci);
 
     {
         constexpr int BLOCK_M = 32;
