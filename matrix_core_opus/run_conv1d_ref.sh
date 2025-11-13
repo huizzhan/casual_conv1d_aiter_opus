@@ -5,10 +5,11 @@
 LIBTORCH_PATH=/root/libtorch
 ARCH=gfx942
 
-# 源文件
+# 源文件# 输出可执行文件
 SRC=conv1d_libtorch_ref.cpp
-# 输出可执行文件
-OUT=conv1d_libtorch_ref_opus.exe
+OUT=conv1d_libtorch_ref.exe
+# SRC=casual_conv1d_copilot.cpp
+# OUT=casual_conv1d_copilot.exe
 rm $OUT
 
 # 编译
